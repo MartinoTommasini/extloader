@@ -4,6 +4,44 @@ from impacket.dcerpc.v5.rpcrt import DCERPCException
 from impacket.smbconnection import SMBConnection
 from .utils import log
 
+def _dedupe(values):
+    seen = set()
+    result = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+def _lookup_candidates(profile_name, domain):
+    candidates = [profile_name]
+
+    # Windows may name a domain profile directory as user.DOMAIN even though the
+    # account name that LSA can resolve is DOMAIN\user or just user.
+    if "." in profile_name:
+        account_name, profile_domain = profile_name.rsplit(".", 1)
+        candidates.extend([
+            profile_domain + "\\" + account_name,
+            domain + "\\" + account_name if domain and domain.upper() != "WORKGROUP" else None,
+            account_name,
+        ])
+    elif domain and domain.upper() != "WORKGROUP":
+        candidates.append(domain + "\\" + profile_name)
+
+    return _dedupe(candidates)
+
+def _sid_from_lookup_response(resp):
+    translated_sid = resp['TranslatedSids']['Sids'][0]
+    rid = translated_sid['RelativeId']
+    domain_index = translated_sid['DomainIndex']
+
+    try:
+        domain_sid = resp['ReferencedDomains']['Domains'][domain_index]['Sid'].formatCanonical()
+    except Exception:
+        return None
+
+    return f"{domain_sid}-{rid}"
+
 def get_user_sids(target, username, auth_value, domain, users, auth_type="password", existing_smb_conn=None):
     """Get SIDs for the specified users using the same authentication method as the main connection."""
     # List of system accounts to skip
@@ -58,21 +96,34 @@ def get_user_sids(target, username, auth_value, domain, users, auth_type="passwo
             resp = lsad.hLsarOpenPolicy2(dce, MAXIMUM_ALLOWED | lsat.POLICY_LOOKUP_NAMES)
             policy_handle = resp['PolicyHandle']
 
-            resp = lsad.hLsarQueryInformationPolicy2(dce, policy_handle, lsad.POLICY_INFORMATION_CLASS.PolicyAccountDomainInformation)
-            domain_sid = resp['PolicyInformation']['PolicyAccountDomainInfo']['DomainSid'].formatCanonical()
-
-            log.info(f"Domain SID is: {domain_sid}")
-
             user_sids = {}
             for user in filtered_users:
-                try:
-                    resp = lsat.hLsarLookupNames2(dce, policy_handle, (user,), lsat.LSAP_LOOKUP_LEVEL.LsapLookupWksta)
-                    rid = resp['TranslatedSids']['Sids'][0]['RelativeId']
-                    user_sid = f"{domain_sid}-{rid}"
-                    user_sids[user] = user_sid
-                    log.info(f"SID for {user}: {user_sid}")
-                except DCERPCException as e:
-                    log.warning(f"Error retrieving SID for {user}: {str(e)}")
+                last_error = None
+                for candidate in _lookup_candidates(user, domain):
+                    try:
+                        resp = lsat.hLsarLookupNames2(
+                            dce,
+                            policy_handle,
+                            (candidate,),
+                            lsat.LSAP_LOOKUP_LEVEL.LsapLookupWksta
+                        )
+                        user_sid = _sid_from_lookup_response(resp)
+                        if not user_sid:
+                            last_error = "lookup response did not include a referenced domain SID"
+                            continue
+
+                        user_sids[user] = user_sid
+                        if candidate == user:
+                            log.info(f"SID for {user}: {user_sid}")
+                        else:
+                            log.info(f"SID for {user}: {user_sid} (resolved as {candidate})")
+                        break
+                    except DCERPCException as e:
+                        last_error = str(e)
+                        log.debug(f"SID lookup candidate failed for {user} as {candidate}: {last_error}")
+
+                if user not in user_sids:
+                    log.warning(f"Error retrieving SID for {user}: {last_error}")
 
             dce.disconnect()
             return user_sids

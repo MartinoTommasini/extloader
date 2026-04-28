@@ -3,7 +3,9 @@ import json
 import hashlib
 import logging
 import os
+import base64
 from .browser_config import BrowserConfigurator
+from .utils import translate_crx_id
 
 log = logging.getLogger("rich")
 
@@ -49,54 +51,118 @@ class PreferencesManager:
         return hash_obj.hexdigest().upper()
 
     @staticmethod
-    def get_extension_id():
+    def get_extension_id(manifest_content=None):
+        if manifest_content:
+            try:
+                if isinstance(manifest_content, (bytes, bytearray)):
+                    manifest_content = manifest_content.decode("utf-8")
+                manifest = json.loads(manifest_content) if isinstance(manifest_content, str) else manifest_content
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                log.error(f"Failed to parse manifest.json while calculating extension ID: {e}")
+                return None
+
+            public_key = manifest.get("key") if isinstance(manifest, dict) else None
+            if public_key:
+                try:
+                    public_key = "".join(str(public_key).split())
+                    public_key_der = base64.b64decode(public_key, validate=True)
+                    public_key_hash = hashlib.sha256(public_key_der).hexdigest()[:32]
+                    return translate_crx_id(public_key_hash)
+                except Exception as e:
+                    log.error(f"Failed to calculate extension ID from manifest key: {e}")
+                    return None
+
         keys_file = 'extension_keys.json'
         if not os.path.exists(keys_file):
-            log.error(f"Extension keys not found. Please run 'sign' command first.")
+            log.error("Extension keys not found and manifest.json does not contain a key.")
             return None
         
         with open(keys_file, 'r', encoding='utf-8') as f:
             keys = json.load(f)
         return keys['crx_id']
 
-    def create_base_extension_json(self, absolute_extension_path):
+    @staticmethod
+    def _permission_sets(manifest):
+        api_permissions = []
+        explicit_hosts = []
+
+        for permission in manifest.get("permissions", []):
+            if isinstance(permission, str) and (
+                "://" in permission or permission == "<all_urls>" or permission.startswith("file://")
+            ):
+                explicit_hosts.append(permission)
+            elif isinstance(permission, str):
+                api_permissions.append(permission)
+
+        for host in manifest.get("host_permissions", []):
+            if isinstance(host, str):
+                explicit_hosts.append(host)
+
+        scriptable_hosts = []
+        for content_script in manifest.get("content_scripts", []):
+            for match in content_script.get("matches", []):
+                if isinstance(match, str):
+                    scriptable_hosts.append(match)
+
         return {
+            "api": sorted(set(api_permissions)),
+            "explicit_host": sorted(set(explicit_hosts)),
+            "manifest_permissions": [],
+            "scriptable_host": sorted(set(scriptable_hosts)),
+        }
+
+    def create_base_extension_json(self, absolute_extension_path, manifest=None):
+        manifest = manifest or {}
+        permissions = self._permission_sets(manifest)
+        return {
+            "account_extension_type": 0,
             "active_permissions": {
-                "api": [
-                    "activeTab", "cookies", "debugger", "webNavigation", 
-                    "webRequest", "scripting"
-                ],
-                "explicit_host": ["<all_urls>"],
-                "manifest_permissions": [],
-                "scriptable_host": ["<all_urls>"]
+                "api": permissions["api"],
+                "explicit_host": permissions["explicit_host"],
+                "manifest_permissions": permissions["manifest_permissions"],
+                "scriptable_host": permissions["scriptable_host"]
             },
             "commands": {},
             "content_settings": [],
             "creation_flags": 38,
-            "filtered_service_worker_events": {
-                "webNavigation.onCompleted": [{}]
-            },
+            "disable_reasons": [],
             "first_install_time": "13378928502176646",
             "from_webstore": False,
             "granted_permissions": {
-                "api": [
-                    "activeTab", "cookies", "debugger", "webNavigation", 
-                    "webRequest", "scripting"
-                ],
-                "explicit_host": ["<all_urls>"],
-                "manifest_permissions": [],
-                "scriptable_host": ["<all_urls>"]
+                "api": permissions["api"],
+                "explicit_host": permissions["explicit_host"],
+                "manifest_permissions": permissions["manifest_permissions"],
+                "scriptable_host": permissions["scriptable_host"]
             },
             "incognito_content_settings": [],
             "incognito_preferences": {},
             "last_update_time": "13378928502176646",
             "location": self.default_location,
+            "manifest": manifest,
             "newAllowFileAccess": True,
             "path": absolute_extension_path,
             "preferences": {},
             "regular_only_preferences": {},
-            "state": 1
+            "state": 1,
+            "version": manifest.get("version", "1.0"),
+            "was_installed_by_default": False,
+            "was_installed_by_oem": False,
+            "withholding_permissions": False
         }
+
+def _remove_existing_path_entries(data, absolute_extension_path, keep_extension_id):
+    settings = data.get("extensions", {}).get("settings", {})
+    stale_ids = [
+        extension_id for extension_id, extension in settings.items()
+        if extension_id != keep_extension_id and extension.get("path") == absolute_extension_path
+    ]
+
+    for extension_id in stale_ids:
+        log.debug(f"Removing stale extension entry for {absolute_extension_path}: {extension_id}")
+        settings.pop(extension_id, None)
+        macs = data.get("protection", {}).get("macs", {}).get("extensions", {})
+        macs.get("settings", {}).pop(extension_id, None)
+        macs.get("settings_encrypted_hash", {}).pop(extension_id, None)
 
 def update_secure_preferences(secure_prefs, absolute_extension_path, target_sid, manifest_content, browser_id="chrome"):
     log.debug(f"=== Starting Secure Preferences Update ===")
@@ -108,7 +174,7 @@ def update_secure_preferences(secure_prefs, absolute_extension_path, target_sid,
     log.debug(f"Using browser config: {prefs_manager.browser_config.__dict__}")
     log.debug(f"Browser seed: {prefs_manager.seed.hex()}")
     
-    extension_id = prefs_manager.get_extension_id()
+    extension_id = prefs_manager.get_extension_id(manifest_content)
     if not extension_id:
         log.error("Failed to get extension ID")
         return None
@@ -116,16 +182,14 @@ def update_secure_preferences(secure_prefs, absolute_extension_path, target_sid,
     data = json.loads(secure_prefs)
     log.debug(f"Using extension ID: {extension_id}")
     
-    extension_json = prefs_manager.create_base_extension_json(absolute_extension_path)
-    log.debug(f"Created base extension JSON with location: {extension_json.get('location')}")
-    
     try:
         manifest = json.loads(manifest_content)
-        extension_json['version'] = manifest.get('version', '1.0')
-        log.debug(f"Added version from manifest: {extension_json['version']}")
     except json.JSONDecodeError:
         log.error("Failed to parse manifest.json")
         return None
+    
+    extension_json = prefs_manager.create_base_extension_json(absolute_extension_path, manifest)
+    log.debug(f"Created base extension JSON with location: {extension_json.get('location')}")
 
     # Ensure extensions settings structure exists
     if "extensions" not in data:
@@ -137,6 +201,8 @@ def update_secure_preferences(secure_prefs, absolute_extension_path, target_sid,
     if "ui" not in data["extensions"]:
         data["extensions"]["ui"] = {}
     data["extensions"]["ui"]["developer_mode"] = True
+
+    _remove_existing_path_entries(data, absolute_extension_path, extension_id)
     
     # Add extension to settings
     data["extensions"]["settings"][extension_id] = extension_json
@@ -180,7 +246,7 @@ def update_preferences(preferences, absolute_extension_path, target_sid, manifes
     log.debug(f"Updating Preferences file")
     
     prefs_manager = PreferencesManager(browser_id)
-    extension_id = prefs_manager.get_extension_id()
+    extension_id = prefs_manager.get_extension_id(manifest_content)
     if not extension_id:
         return None
 
@@ -211,14 +277,14 @@ def update_preferences(preferences, absolute_extension_path, target_sid, manifes
     if "ui" not in data["protection"]:
         data["protection"]["ui"] = {}
 
-    extension_json = prefs_manager.create_base_extension_json(absolute_extension_path)
     try:
         manifest = json.loads(manifest_content)
-        extension_json['version'] = manifest.get('version', '1.0')
     except json.JSONDecodeError:
         log.error("Failed to parse manifest.json")
         return None
 
+    extension_json = prefs_manager.create_base_extension_json(absolute_extension_path, manifest)
+    _remove_existing_path_entries(data, absolute_extension_path, extension_id)
     data["extensions"]["settings"][extension_id] = extension_json
     
     # Calculate extension HMAC
